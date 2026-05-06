@@ -54,6 +54,8 @@
 #define CALYPSO_MAX_ENCODED_SFI  0x1F
 #define CALYPSO_HCE_TOKEN_LEN    2
 #define CALYPSO_DUMP_FILENAME_MAX_SERIALS 8
+#define CALYPSO_MAX_EF_LIST_LIDS 128
+#define CALYPSO_MAX_LID_CANDIDATES 384
 
 #define CALYPSO_MANUFACTURERS_RESOURCE "calypso/manufacturers"
 #define CALYPSO_IC_FAMILIES_RESOURCE   "calypso/ic_families"
@@ -132,6 +134,23 @@ typedef struct {
     uint16_t path[CALYPSO_DUMP_PATH_MAX];
     size_t path_len;
 } calypso_file_ref_t;
+
+typedef enum {
+    CALYPSO_FILE_SOURCE_KNOWN = 0x01,
+    CALYPSO_FILE_SOURCE_EF_LIST = 0x02,
+} calypso_file_source_t;
+
+typedef struct {
+    calypso_file_ref_t ref;
+    uint8_t source;
+    char name_storage[16];
+} calypso_file_candidate_t;
+
+typedef struct {
+    uint16_t lids[CALYPSO_MAX_EF_LIST_LIDS];
+    size_t count;
+    bool truncated;
+} calypso_ef_list_t;
 
 typedef struct {
     uint16_t tag;
@@ -1423,7 +1442,99 @@ static void calypso_json_add_get_data(json_t *entries, const calypso_get_data_pr
     json_array_append_new(entries, entry);
 }
 
-static size_t calypso_probe_get_data_objects(json_t *entries, bool print_results, bool verbose) {
+static void calypso_ef_list_add_lid(calypso_ef_list_t *ef_list, uint16_t lid) {
+    if (ef_list == NULL) {
+        return;
+    }
+
+    for (size_t i = 0; i < ef_list->count; i++) {
+        if (ef_list->lids[i] == lid) {
+            return;
+        }
+    }
+
+    if (ef_list->count >= ARRAYLEN(ef_list->lids)) {
+        ef_list->truncated = true;
+        return;
+    }
+
+    ef_list->lids[ef_list->count++] = lid;
+}
+
+static void calypso_parse_ef_list_entries(const uint8_t *data, size_t data_len, calypso_ef_list_t *ef_list) {
+    const unsigned char *p = data;
+    size_t left = data_len;
+
+    while (left > 0) {
+        struct tlv entry = {0};
+        if (tlv_parse_tl(&p, &left, &entry) == false || entry.len > left) {
+            return;
+        }
+
+        if (entry.tag == 0xC1 && entry.len >= 2) {
+            uint16_t lid = ((uint16_t)p[0] << 8) | p[1];
+            calypso_ef_list_add_lid(ef_list, lid);
+        }
+
+        p += entry.len;
+        left -= entry.len;
+    }
+}
+
+static void calypso_parse_ef_list_object(const uint8_t *data, size_t data_len, calypso_ef_list_t *ef_list) {
+    const unsigned char *p = data;
+    size_t left = data_len;
+
+    while (left > 0) {
+        struct tlv tlv = {0};
+        if (tlv_parse_tl(&p, &left, &tlv) == false || tlv.len > left) {
+            return;
+        }
+
+        if (tlv.tag == 0xC0) {
+            calypso_parse_ef_list_entries(p, tlv.len, ef_list);
+        } else if (tlv.tag == 0xC1 && tlv.len >= 2) {
+            uint16_t lid = ((uint16_t)p[0] << 8) | p[1];
+            calypso_ef_list_add_lid(ef_list, lid);
+        }
+
+        p += tlv.len;
+        left -= tlv.len;
+    }
+}
+
+static bool calypso_ef_list_contains_lid(const calypso_ef_list_t *ef_list, uint16_t lid) {
+    if (ef_list == NULL) {
+        return false;
+    }
+
+    for (size_t i = 0; i < ef_list->count; i++) {
+        if (ef_list->lids[i] == lid) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void calypso_print_ef_list_lids(const calypso_ef_list_t *ef_list) {
+    if (ef_list == NULL || ef_list->count == 0) {
+        return;
+    }
+
+    char lids[CALYPSO_MAX_EF_LIST_LIDS * 6 + 1] = {0};
+    size_t pos = 0;
+    for (size_t i = 0; i < ef_list->count && pos < sizeof(lids); i++) {
+        int written = snprintf(lids + pos, sizeof(lids) - pos, "%s%04X", i == 0 ? "" : " ", ef_list->lids[i]);
+        if (written < 0 || (size_t)written >= sizeof(lids) - pos) {
+            break;
+        }
+        pos += (size_t)written;
+    }
+
+    PrintAndLogEx(SUCCESS, " EF List LIDs      : " _YELLOW_("%s") "%s", lids, ef_list->truncated ? " (truncated)" : "");
+}
+
+static size_t calypso_probe_get_data_objects(json_t *entries, bool print_results, bool verbose, calypso_ef_list_t *ef_list) {
     size_t found = 0;
 
     if (print_results || verbose) {
@@ -1454,6 +1565,10 @@ static size_t calypso_probe_get_data_objects(json_t *entries, bool print_results
             }
             if (entries != NULL) {
                 calypso_json_add_get_data(entries, probe, response, response_len);
+            }
+            if (probe->tag == 0x00C0) {
+                calypso_parse_ef_list_object(response, response_len, ef_list);
+                calypso_print_ef_list_lids(ef_list);
             }
             found++;
             continue;
@@ -1489,6 +1604,129 @@ static void calypso_file_path_string(const calypso_file_ref_t *file, char *out, 
         }
         pos += (size_t)written;
     }
+}
+
+static uint16_t calypso_file_ref_leaf_lid(const calypso_file_ref_t *file) {
+    if (file == NULL || file->path_len == 0) {
+        return 0;
+    }
+    return file->path[file->path_len - 1];
+}
+
+static bool calypso_file_ref_path_equals(const calypso_file_ref_t *file, const uint16_t *path, size_t path_len) {
+    if (file == NULL || path == NULL || file->path_len != path_len) {
+        return false;
+    }
+    return memcmp(file->path, path, path_len * sizeof(path[0])) == 0;
+}
+
+static bool calypso_lid_is_known(uint16_t lid) {
+    for (size_t i = 0; i < ARRAYLEN(calypso_file_refs); i++) {
+        if (calypso_file_ref_leaf_lid(&calypso_file_refs[i]) == lid) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool calypso_lid_seen(const uint16_t *lids, size_t count, uint16_t lid) {
+    for (size_t i = 0; i < count; i++) {
+        if (lids[i] == lid) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static calypso_file_candidate_t *calypso_find_file_candidate_by_path(calypso_file_candidate_t *candidates, size_t count, const uint16_t *path, size_t path_len) {
+    for (size_t i = 0; i < count; i++) {
+        if (calypso_file_ref_path_equals(&candidates[i].ref, path, path_len)) {
+            return &candidates[i];
+        }
+    }
+    return NULL;
+}
+
+static bool calypso_add_file_candidate(calypso_file_candidate_t *candidates, size_t capacity, size_t *count, const char *name, const uint16_t *path, size_t path_len, uint8_t source) {
+    if (candidates == NULL || count == NULL || path == NULL || path_len == 0 || path_len > CALYPSO_DUMP_PATH_MAX) {
+        return false;
+    }
+
+    calypso_file_candidate_t *existing = calypso_find_file_candidate_by_path(candidates, *count, path, path_len);
+    if (existing != NULL) {
+        existing->source |= source;
+        return true;
+    }
+
+    if (*count >= capacity) {
+        return false;
+    }
+
+    calypso_file_candidate_t *candidate = &candidates[*count];
+    memset(candidate, 0, sizeof(*candidate));
+    if (name == NULL) {
+        snprintf(candidate->name_storage, sizeof(candidate->name_storage), "EF_%04X", path[path_len - 1]);
+        candidate->ref.name = candidate->name_storage;
+    } else {
+        candidate->ref.name = name;
+    }
+    candidate->ref.sfi = -1;
+    memcpy(candidate->ref.path, path, path_len * sizeof(path[0]));
+    candidate->ref.path_len = path_len;
+    candidate->source = source;
+    (*count)++;
+    return true;
+}
+
+static size_t calypso_infer_lid_path(uint16_t lid, uint16_t *path) {
+    if (path == NULL) {
+        return 0;
+    }
+
+    uint16_t parent = lid & 0xFF00;
+    uint8_t high = (uint8_t)(lid >> 8);
+    if (parent != 0x0000 && high != 0x2F && high != 0x3F) {
+        path[0] = parent;
+        path[1] = lid;
+        return 2;
+    }
+
+    path[0] = lid;
+    return 1;
+}
+
+static size_t calypso_build_lid_file_candidates(const calypso_ef_list_t *ef_list, calypso_file_candidate_t *candidates, size_t capacity) {
+    size_t count = 0;
+
+    for (size_t i = 0; i < ARRAYLEN(calypso_file_refs); i++) {
+        uint8_t source = CALYPSO_FILE_SOURCE_KNOWN;
+        if (calypso_ef_list_contains_lid(ef_list, calypso_file_ref_leaf_lid(&calypso_file_refs[i]))) {
+            source |= CALYPSO_FILE_SOURCE_EF_LIST;
+        }
+        calypso_add_file_candidate(candidates, capacity, &count, calypso_file_refs[i].name, calypso_file_refs[i].path, calypso_file_refs[i].path_len, source);
+    }
+
+    if (ef_list == NULL) {
+        return count;
+    }
+
+    for (size_t i = 0; i < ef_list->count; i++) {
+        uint16_t lid = ef_list->lids[i];
+        if (calypso_lid_is_known(lid)) {
+            continue;
+        }
+
+        uint16_t inferred_path[CALYPSO_DUMP_PATH_MAX] = {0};
+        size_t inferred_path_len = calypso_infer_lid_path(lid, inferred_path);
+        calypso_add_file_candidate(candidates, capacity, &count, NULL, inferred_path, inferred_path_len, CALYPSO_FILE_SOURCE_EF_LIST);
+
+        uint16_t direct_path[CALYPSO_DUMP_PATH_MAX] = {lid};
+        if (inferred_path_len != 1 || inferred_path[0] != lid) {
+            calypso_add_file_candidate(candidates, capacity, &count, NULL, direct_path, 1, CALYPSO_FILE_SOURCE_EF_LIST);
+        }
+    }
+
+    return count;
 }
 
 static int calypso_read_binary_sfi(uint8_t sfi, uint8_t *out, size_t out_len, size_t *read_len, uint16_t *sw) {
@@ -1722,7 +1960,7 @@ static bool calypso_dump_sfi(uint8_t sfi, json_t *sfi_files, bool verbose, size_
     return true;
 }
 
-static bool calypso_dump_file_path(const calypso_file_ref_t *ref, json_t *files, bool verbose, size_t *file_count, size_t *record_count, int *first_error) {
+static bool calypso_dump_file_path(const calypso_file_ref_t *ref, uint8_t source, json_t *files, bool verbose, size_t *file_count, size_t *record_count, int *first_error) {
     uint8_t fci[APDU_RES_LEN] = {0};
     size_t fci_len = 0;
     uint16_t select_sw = 0;
@@ -1768,7 +2006,13 @@ static bool calypso_dump_file_path(const calypso_file_ref_t *ref, json_t *files,
     }
 
     PrintAndLogEx(INFO, "");
-    PrintAndLogEx(INFO, "--- " _CYAN_("%s") " (%s) --------------------", ref->name, path);
+    if ((source & CALYPSO_FILE_SOURCE_KNOWN) && (source & CALYPSO_FILE_SOURCE_EF_LIST)) {
+        PrintAndLogEx(INFO, "--- " _CYAN_("%s") " (%s) (known, ef list) --------------------", ref->name, path);
+    } else if (source & CALYPSO_FILE_SOURCE_EF_LIST) {
+        PrintAndLogEx(INFO, "--- " _CYAN_("%s") " (%s) (" _YELLOW_("ef list") ") --------------------", ref->name, path);
+    } else {
+        PrintAndLogEx(INFO, "--- " _CYAN_("%s") " (%s) (known) --------------------", ref->name, path);
+    }
     if (fci_len > 0) {
         PrintAndLogEx(SUCCESS, "  fci              : " _YELLOW_("%s"), sprint_hex(fci, fci_len));
     }
@@ -2079,7 +2323,8 @@ static int calypso_dump_selected_df(const calypso_select_result_t *selected, jso
     calypso_json_add_select(app, selected);
 
     json_t *get_data = json_array();
-    if (calypso_probe_get_data_objects(get_data, true, verbose) > 0) {
+    calypso_ef_list_t ef_list = {0};
+    if (calypso_probe_get_data_objects(get_data, true, verbose, &ef_list) > 0) {
         json_object_set_new(app, "dataObjects", get_data);
     } else {
         json_decref(get_data);
@@ -2113,15 +2358,28 @@ static int calypso_dump_selected_df(const calypso_select_result_t *selected, jso
     if (first_error == PM3_SUCCESS) {
         calypso_reselect_exact_df_name(selected, verbose);
         PrintAndLogEx(INFO, "");
-        PrintAndLogEx(INFO, "--- " _CYAN_("Search known file LID paths") " -------------");
-        for (size_t i = 0; i < ARRAYLEN(calypso_file_refs); i++) {
+        PrintAndLogEx(INFO, "--- " _CYAN_("Search known/discovered file LID paths") " --");
+
+        calypso_file_candidate_t candidates[CALYPSO_MAX_LID_CANDIDATES] = {0};
+        size_t candidate_count = calypso_build_lid_file_candidates(&ef_list, candidates, ARRAYLEN(candidates));
+        uint16_t dumped_lids[CALYPSO_MAX_LID_CANDIDATES] = {0};
+        size_t dumped_lid_count = 0;
+        for (size_t i = 0; i < candidate_count; i++) {
             if (kbd_enter_pressed()) {
                 PrintAndLogEx(WARNING, "Aborted by user");
                 first_error = PM3_EOPABORTED;
                 break;
             }
+            uint16_t leaf_lid = calypso_file_ref_leaf_lid(&candidates[i].ref);
+            if ((candidates[i].source & CALYPSO_FILE_SOURCE_EF_LIST) && calypso_lid_seen(dumped_lids, dumped_lid_count, leaf_lid)) {
+                continue;
+            }
             calypso_reselect_exact_df_name(selected, verbose);
-            calypso_dump_file_path(&calypso_file_refs[i], lid_files, verbose, &lid_file_count, &record_count, &first_error);
+            if (calypso_dump_file_path(&candidates[i].ref, candidates[i].source, lid_files, verbose, &lid_file_count, &record_count, &first_error)) {
+                if (dumped_lid_count < ARRAYLEN(dumped_lids) && calypso_lid_seen(dumped_lids, dumped_lid_count, leaf_lid) == false) {
+                    dumped_lids[dumped_lid_count++] = leaf_lid;
+                }
+            }
             if (first_error != PM3_SUCCESS) {
                 break;
             }
